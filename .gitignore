@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+build/
+*.tsbuildinfo
+
+# environment (secrets)
+.env
+.env.*
+!.env.example
+
+# local file storage: keep the folder layout out of git, never the uploads or backups
+backend/storage/*/*
+!backend/storage/*/.keep
+
+# logs / OS / editor
+*.log
+.DS_Store
+.vscode/
+.idea/
+coverage/
