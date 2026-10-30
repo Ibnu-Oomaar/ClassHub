@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "start": "nest start",
+    "start": "bun dist/src/main.js",
     "start:dev": "nest start --watch",
     "start:prod": "bun dist/src/main.js",
     "seed:class-master": "bun run build && node dist/src/database/seed-class-master.js",
