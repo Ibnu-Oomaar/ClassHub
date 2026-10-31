@@ -5,6 +5,7 @@ import { Spinner } from '@/components/states';
 import { Alert } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import type { MarkSheet } from '@/features/marks/types';
 import { upload, post } from '@/lib/api';
@@ -14,15 +15,18 @@ import { useAction } from '@/lib/use-action';
 
 interface PreviewRecord {
   studentId: string;
+  studentName: string;
   score: string;
   recordNumber: number;
   matchedStudentName: string | null;
+  extractionIssue?: string;
   currentScore: number | null;
   issues: string[];
   valid: boolean;
 }
 
 interface ImportPreview {
+  isPdf: boolean;
   maxMarks: number;
   records: PreviewRecord[];
   summary: {
@@ -37,8 +41,12 @@ interface ImportPreview {
 }
 
 interface ImportConfirmation {
-  entries: { studentCode: string; score: number; expectedCurrentScore: number | null }[];
+  entries: { studentCode: string; documentStudentName: string; score: number; expectedCurrentScore: number | null }[];
   overwriteExisting: boolean;
+}
+
+interface ImportReviewRequest {
+  records: { studentCode: string; studentName: string; score: string; recordNumber: number }[];
 }
 
 export function MarksImportPanel({
@@ -51,6 +59,7 @@ export function MarksImportPanel({
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [selectedRecords, setSelectedRecords] = useState<number[]>([]);
+  const [corrections, setCorrections] = useState<Record<number, Pick<PreviewRecord, 'studentId' | 'studentName' | 'score'>>>({});
   const [confirming, setConfirming] = useState(false);
 
   const processDocument = useAction<File, ImportPreview>({
@@ -59,6 +68,16 @@ export function MarksImportPanel({
     onSuccess: (result) => {
       setPreview(result);
       setSelectedRecords(result.records.filter((record) => record.valid).map((record) => record.recordNumber));
+      setCorrections({});
+    },
+  });
+
+  const reviewCorrections = useAction<ImportReviewRequest, ImportPreview>({
+    run: (body) => post<ImportPreview>(`/marks/examination-subjects/${examinationSubjectId}/import-review`, body),
+    success: 'Corrected fields were revalidated against the class roster and exam maximum.',
+    onSuccess: (result) => {
+      setPreview(result);
+      setCorrections({});
     },
   });
 
@@ -69,14 +88,26 @@ export function MarksImportPanel({
     onSuccess: () => {
       setPreview(null);
       setSelectedRecords([]);
+      setCorrections({});
       setFile(null);
       setConfirming(false);
     },
   });
 
-  const selected = preview?.records.filter((record) => selectedRecords.includes(record.recordNumber)) ?? [];
+  const selected = preview?.records
+    .filter((record) => selectedRecords.includes(record.recordNumber))
+    .map((record) => ({ ...record, ...corrections[record.recordNumber] })) ?? [];
   const overwrites = selected.filter((record) => record.currentScore !== null);
-  const isPending = processDocument.isPending || confirmImport.isPending;
+  const isPending = processDocument.isPending || reviewCorrections.isPending || confirmImport.isPending;
+  const selectedIsEdited = selected.some((record) => {
+    const original = preview?.records.find((candidate) => candidate.recordNumber === record.recordNumber);
+    return !!original && (
+      record.studentId !== original.studentId ||
+      record.studentName !== original.studentName ||
+      record.score !== original.score
+    );
+  });
+  const selectedIsValid = selected.length > 0 && selected.every((record) => record.valid);
 
   const updateSelection = (recordNumber: number, checked: boolean) => {
     setSelectedRecords((current) =>
@@ -89,7 +120,8 @@ export function MarksImportPanel({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 id="marks-import-title" className="font-display text-lg">Import marks</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Supported formats: PDF, Excel (.xlsx), and CSV. Required columns: Student ID and Score.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Supported formats: PDF, Excel (.xlsx), and CSV. PDF text and scanned pages are processed locally with OCR.</p>
+          <p className="mt-1 text-sm text-muted-foreground">The existing database name remains authoritative; imported names are used only for review.</p>
         </div>
         <label className="flex min-w-0 flex-col gap-2 sm:w-96">
           <span className="text-sm font-medium">Choose a marks document</span>
@@ -101,6 +133,7 @@ export function MarksImportPanel({
               setFile(event.target.files?.[0] ?? null);
               setPreview(null);
               setSelectedRecords([]);
+              setCorrections({});
             }}
             className="block w-full text-sm file:mr-3 file:rounded-md file:border-0 file:bg-subtle file:px-3 file:py-2 file:font-medium file:text-foreground disabled:opacity-70"
             aria-label="Choose a PDF, .xlsx, or CSV marks document"
@@ -137,11 +170,17 @@ export function MarksImportPanel({
             <p>Duplicate Student IDs: <strong>{preview.summary.duplicateStudentIds}</strong></p>
             <p>Potential overwrites: <strong>{preview.summary.overwrites}</strong></p>
             <p>Selected for import: <strong>{selected.length}</strong></p>
+            <p>Maximum score: <strong>{formatScore(preview.maxMarks)}</strong></p>
           </div>
 
           {preview.summary.invalidRecords > 0 ? (
             <Alert tone="warning" title="Invalid records are excluded">
-              Correct the source document and upload it again, or leave invalid records excluded. Valid records remain available for review.
+              Review or correct the affected fields, then revalidate them. Unresolved invalid records cannot be imported.
+            </Alert>
+          ) : null}
+          {preview.isPdf ? (
+            <Alert tone="info" title="PDF names are for verification only">
+              Scores are matched by Student ID. The database student name is shown separately and will not be changed by this import.
             </Alert>
           ) : null}
 
@@ -151,26 +190,64 @@ export function MarksImportPanel({
                 <TR>
                   <TH className="w-12">Import</TH>
                   <TH>Document Student ID</TH>
-                  <TH>Matched student</TH>
+                  <TH>Document full name</TH>
+                  <TH>Matched database student</TH>
                   <TH>Incoming score</TH>
                   <TH>Current score</TH>
                   <TH>Validation</TH>
                 </TR>
               </THead>
               <TBody>
-                {preview.records.map((record) => (
-                  <TR key={record.recordNumber}>
+                {preview.records.map((record) => {
+                  const values = { ...record, ...corrections[record.recordNumber] };
+                  const edited = values.studentId !== record.studentId || values.studentName !== record.studentName || values.score !== record.score;
+                  return (
+                    <TR key={record.recordNumber}>
                     <TD>
                       <Checkbox
                         checked={selectedRecords.includes(record.recordNumber)}
-                        disabled={!record.valid || disabled || isPending}
+                        disabled={(!record.valid && !preview.isPdf) || disabled || isPending}
                         onCheckedChange={(checked) => updateSelection(record.recordNumber, checked === true)}
                         aria-label={`Include record ${record.recordNumber} for ${record.studentId || 'missing Student ID'}`}
                       />
                     </TD>
-                    <TD className="font-medium">{record.studentId || 'Missing'}</TD>
+                    <TD>
+                      {preview.isPdf ? (
+                        <Input
+                          value={values.studentId}
+                          maxLength={40}
+                          disabled={disabled || isPending}
+                          onChange={(event) => setCorrections((current) => ({ ...current, [record.recordNumber]: { ...values, studentId: event.target.value } }))}
+                          aria-label={`Correct Student ID for result row ${record.recordNumber}`}
+                          className="h-9 min-w-32"
+                        />
+                      ) : record.studentId || 'Missing'}
+                    </TD>
+                    <TD>
+                      {preview.isPdf ? (
+                        <Input
+                          value={values.studentName}
+                          maxLength={150}
+                          disabled={disabled || isPending}
+                          onChange={(event) => setCorrections((current) => ({ ...current, [record.recordNumber]: { ...values, studentName: event.target.value } }))}
+                          aria-label={`Correct extracted student name for result row ${record.recordNumber}`}
+                          className="h-9 min-w-40"
+                        />
+                      ) : record.studentName || '—'}
+                    </TD>
                     <TD>{record.matchedStudentName ?? 'No match'}</TD>
-                    <TD className="tabular-nums">{record.score || 'Missing'}</TD>
+                    <TD className="tabular-nums">
+                      {preview.isPdf ? (
+                        <Input
+                          value={values.score}
+                          inputMode="decimal"
+                          disabled={disabled || isPending}
+                          onChange={(event) => setCorrections((current) => ({ ...current, [record.recordNumber]: { ...values, score: event.target.value } }))}
+                          aria-label={`Correct score for result row ${record.recordNumber}`}
+                          className="h-9 min-w-24"
+                        />
+                      ) : record.score || 'Missing'}
+                    </TD>
                     <TD className="tabular-nums">
                       {record.currentScore === null ? '—' : (
                         <span className="font-medium text-pen">
@@ -179,14 +256,15 @@ export function MarksImportPanel({
                       )}
                     </TD>
                     <TD>
-                      {record.valid ? <span className="text-success">Valid</span> : (
+                      {edited ? <span className="text-muted-foreground">Edited; server will revalidate</span> : record.valid ? <span className="text-success">Valid</span> : (
                         <ul className="list-disc space-y-1 pl-4 text-pen">
                           {record.issues.map((issue) => <li key={issue}>{issue}</li>)}
                         </ul>
                       )}
                     </TD>
-                  </TR>
-                ))}
+                    </TR>
+                  );
+                })}
               </TBody>
             </Table>
           </div>
@@ -196,10 +274,32 @@ export function MarksImportPanel({
               {selected.length > 0 ? `${pluralize(selected.length, 'record')} selected for import.` : 'Select at least one valid record.'}
               {overwrites.length > 0 ? ` ${pluralize(overwrites.length, 'existing score')} will be overwritten after confirmation.` : ''}
             </p>
-            <Button disabled={selected.length === 0 || disabled || isPending} onClick={() => setConfirming(true)}>
-              {confirmImport.isPending ? <Spinner /> : <Upload />}
-              Confirm import
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              {preview.isPdf ? (
+                <Button
+                  variant="outline"
+                  disabled={disabled || isPending}
+                  onClick={() => reviewCorrections.mutate({
+                    records: preview.records.map((record) => ({
+                      recordNumber: record.recordNumber,
+                      studentCode: (corrections[record.recordNumber]?.studentId ?? record.studentId).trim(),
+                      studentName: corrections[record.recordNumber]?.studentName ?? record.studentName,
+                      score: (corrections[record.recordNumber]?.score ?? record.score).trim(),
+                    })),
+                  })}
+                >
+                  {reviewCorrections.isPending ? <Spinner /> : null}
+                  Revalidate PDF fields
+                </Button>
+              ) : null}
+              <Button
+                disabled={!selectedIsValid || selectedIsEdited || disabled || isPending}
+                onClick={() => setConfirming(true)}
+              >
+                {confirmImport.isPending ? <Spinner /> : <Upload />}
+                Confirm import
+              </Button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -219,6 +319,7 @@ export function MarksImportPanel({
         onConfirm={() => confirmImport.mutate({
           entries: selected.map((record) => ({
             studentCode: record.studentId,
+            documentStudentName: record.studentName,
             score: Number(record.score),
             expectedCurrentScore: record.currentScore,
           })),

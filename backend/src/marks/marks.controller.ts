@@ -8,6 +8,7 @@ import { AuthenticatedUser } from '../common/interfaces/authenticated-user.inter
 import { Paginated } from '../common/pagination/pagination.util';
 import { CreateMarkDto } from './dto/create-mark.dto';
 import { ConfirmMarkImportDto } from './dto/confirm-mark-import.dto';
+import { ReviewMarkImportDto } from './dto/review-mark-import.dto';
 import { MarksQueueQueryDto } from './dto/marks-queue-query.dto';
 import { ReviewMarksDto } from './dto/review-marks.dto';
 import { SaveMarksDto } from './dto/save-marks.dto';
@@ -68,6 +69,17 @@ export class MarksController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.marks.previewImport(id, file, user);
+  }
+
+  @Post('examination-subjects/:id/import-review')
+  @Roles(Role.TEACHER)
+  @ApiOperation({ summary: 'Revalidate manually corrected document result fields before import' })
+  reviewImport(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReviewMarkImportDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.marks.reviewImport(id, dto, user);
   }
 
   @Post('examination-subjects/:id/import-confirm')

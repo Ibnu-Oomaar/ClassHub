@@ -1,16 +1,25 @@
 import ExcelJS from 'exceljs';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { PDFParse } from 'pdf-parse';
+import { OEM, createWorker, type Worker } from 'tesseract.js';
 import { BadRequestException, PayloadTooLargeException } from '@nestjs/common';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
 
 export interface ExtractedMarkRecord {
   studentId: string;
   score: string;
   recordNumber: number;
+  studentName?: string;
+  extractionIssue?: string;
 }
 
 const MAX_RECORDS = 500;
+const MAX_PDF_PAGES = 50;
 const CSV_DELIMITERS = [',', ';', '\t', '|'];
+const nodeRequire = createRequire(__filename);
+const languageDataPath = resolve(dirname(nodeRequire.resolve('@tesseract.js-data/eng')), '4.0.0');
+let ocrWorkerPromise: Promise<Worker> | null = null;
 
 function headerIndexes(values: unknown[]): { studentId: number; score: number } | null {
   const headers = values.map((value) => String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9]/g, ''));
@@ -116,79 +125,154 @@ async function parseExcelDocument(buffer: Buffer): Promise<ExtractedMarkRecord[]
   return nonEmpty;
 }
 
-function pdfHeaderIndexes(line: string): { studentId: number; score: number } | null {
-  const cells = line.split(/\t+|\s{2,}/).map((cell) => cell.trim());
-  const indexes = headerIndexes(cells);
-  if (indexes) return indexes;
-  if (cells.length !== 1) return null;
-
-  const words = line.split(/\s+/).map((word) => word.toLowerCase().replace(/[^a-z0-9]/g, ''));
-  if (words.length === 3 && words[0] === 'student' && words[1] === 'id' && words[2] === 'score') {
-    return { studentId: 0, score: 1 };
-  }
-  if (words.length === 3 && words[0] === 'score' && words[1] === 'student' && words[2] === 'id') {
-    return { studentId: 1, score: 0 };
-  }
-  return null;
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function parsePdfDocument(buffer: Buffer): Promise<ExtractedMarkRecord[]> {
+function sourceQuality(text: string, knownStudentIds: string[]): number {
+  const knownIdCount = knownStudentIds.reduce((count, id) => {
+    const matcher = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(id)}($|[^\\p{L}\\p{N}])`, 'giu');
+    return count + [...text.matchAll(matcher)].length;
+  }, 0);
+  const contentLines = text.split(/\r?\n/).filter((line) => /\p{L}|\d/u.test(line)).length;
+  return knownIdCount * 1000 + contentLines * 10 + Math.min(text.length, 9999) / 10000;
+}
+
+function extractPdfRecords(text: string, knownStudentIds: string[]): ExtractedMarkRecord[] {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !/^--\s*\d+\s+of\s+\d+\s*--$/.test(line));
+  const ids = [...new Set(knownStudentIds.map((id) => id.trim()).filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+  const idPattern = ids.length > 0
+    ? new RegExp(`(^|[^\\p{L}\\p{N}])(${ids.map(escapeRegExp).join('|')})(?=$|[^\\p{L}\\p{N}])`, 'giu')
+    : null;
+  const records: ExtractedMarkRecord[] = [];
+
+  for (const line of lines) {
+    const foundIds = idPattern ? [...line.matchAll(idPattern)].map((match) => match[2]) : [];
+    if (foundIds.length === 1) {
+      const studentId = foundIds[0];
+      const withoutId = line.replace(idPattern!, ' ').replace(/\s+/g, ' ').trim();
+      const scoreMatches = [...withoutId.matchAll(/(?<![\p{L}\p{N}.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?![\p{L}\p{N}.])/gu)];
+      const scoreMatch = scoreMatches.at(-1);
+      const score = scoreMatch?.[0] ?? '';
+      const studentName = scoreMatch
+        ? `${withoutId.slice(0, scoreMatch.index)} ${withoutId.slice((scoreMatch.index ?? 0) + score.length)}`.replace(/\s+/g, ' ').trim()
+        : withoutId;
+      records.push({
+        studentId,
+        score,
+        studentName,
+        recordNumber: records.length + 1,
+        ...(foundIds.length !== 1 || scoreMatches.length !== 1 || !studentName
+          ? { extractionIssue: 'Student details were not clearly arranged on one row; verify or correct the extracted fields.' }
+          : {}),
+      });
+      continue;
+    }
+
+    if (foundIds.length > 1 || /\d/.test(line)) {
+      const tokens = line.match(/[\p{L}\p{N}][\p{L}\p{N}/-]{1,39}/gu) ?? [];
+      const candidateId = foundIds.length > 1
+        ? foundIds.join(', ')
+        : tokens.find((token) => /[A-Za-z]/.test(token) && /\d/.test(token)) ?? '';
+      const withoutId = candidateId ? line.replace(candidateId, ' ').replace(/\s+/g, ' ').trim() : line;
+      const scoreMatches = foundIds.length > 1
+        ? []
+        : [...withoutId.matchAll(/(?<![\p{L}\p{N}.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?![\p{L}\p{N}.])/gu)];
+      const scoreMatch = scoreMatches.at(-1);
+      const score = scoreMatch?.[0] ?? '';
+      records.push({
+        studentId: candidateId,
+        score,
+        studentName: scoreMatch
+          ? `${withoutId.slice(0, scoreMatch.index)} ${withoutId.slice((scoreMatch.index ?? 0) + score.length)}`.replace(/\s+/g, ' ').trim()
+          : withoutId,
+        recordNumber: records.length + 1,
+        extractionIssue: candidateId
+          ? 'Student ID could not be matched confidently. Review the ID and score manually.'
+          : 'Student ID could not be identified confidently. Enter the ID and score manually.',
+      });
+    }
+  }
+
+  if (records.length === 0) {
+    return lines.slice(0, MAX_RECORDS).map((line, index) => ({
+      studentId: '',
+      score: '',
+      studentName: line,
+      recordNumber: index + 1,
+      extractionIssue: 'No student result row could be identified. Review and enter the student ID and score manually.',
+    }));
+  }
+  if (records.length > MAX_RECORDS) throw new PayloadTooLargeException(`A maximum of ${MAX_RECORDS} mark records can be imported at once.`);
+  return records;
+}
+
+async function getOcrWorker(): Promise<Worker> {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = createWorker('eng', OEM.LSTM_ONLY, {
+      langPath: languageDataPath,
+      gzip: true,
+      cacheMethod: 'none',
+    }).catch((error: unknown) => {
+      ocrWorkerPromise = null;
+      throw error;
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+export async function terminateOcrWorker(): Promise<void> {
+  const pendingWorker = ocrWorkerPromise;
+  ocrWorkerPromise = null;
+  if (pendingWorker) await (await pendingWorker).terminate();
+}
+
+async function parsePdfDocument(buffer: Buffer, knownStudentIds: string[]): Promise<ExtractedMarkRecord[]> {
   if (buffer.length < 5 || buffer.toString('ascii', 0, 5) !== '%PDF-') {
     throw new BadRequestException('The uploaded file is not a valid PDF document.');
   }
   const parser = new PDFParse({ data: buffer });
   try {
-    const { text } = await parser.getText();
-    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const headers = lines.flatMap((line, index) => {
-      const indexes = pdfHeaderIndexes(line);
-      return indexes ? [{ lineNumber: index, indexes }] : [];
-    });
-    if (headers.length === 0 || headers.some(({ indexes }) =>
-      indexes.studentId !== headers[0].indexes.studentId || indexes.score !== headers[0].indexes.score,
-    )) {
-      throw new BadRequestException('A text-based PDF with a clear Student ID and Score table header is required. Scanned or image-only PDFs cannot be read.');
+    const text = await parser.getText();
+    if (text.total > MAX_PDF_PAGES) {
+      throw new PayloadTooLargeException(`PDF documents are limited to ${MAX_PDF_PAGES} pages for local OCR processing.`);
     }
 
-    const { lineNumber, indexes } = headers[0];
+    const screenshots = await parser.getScreenshot({ scale: 1.75, imageDataUrl: false, imageBuffer: true });
+    const worker = await getOcrWorker();
     const records: ExtractedMarkRecord[] = [];
-    for (let index = lineNumber + 1; index < lines.length; index++) {
-      const line = lines[index];
-      if (/^--\s*\d+\s+of\s+\d+\s*--$/.test(line)) continue;
-      if (pdfHeaderIndexes(line)) continue;
-      const cells = line.split(/\t+|\s{2,}/).map((cell) => cell.trim());
-      if (cells.length === 1) {
-        const simpleRow = line.split(/\s+/);
-        if (simpleRow.length === 2) cells.splice(0, 1, ...simpleRow);
-      }
-      records.push({
-        studentId: cells[indexes.studentId] ?? '',
-        score: cells[indexes.score] ?? '',
-        recordNumber: records.length + 1,
-      });
+    for (const screenshot of screenshots.pages) {
+      const pageText = text.pages.find((page) => page.num === screenshot.pageNumber)?.text ?? '';
+      const ocrResult = await worker.recognize(Buffer.from(screenshot.data));
+      const ocrText = ocrResult.data.text;
+      const selectedText = sourceQuality(pageText, knownStudentIds) >= sourceQuality(ocrText, knownStudentIds) ? pageText : ocrText;
+      const pageRecords = extractPdfRecords(selectedText, knownStudentIds);
+      for (const record of pageRecords) records.push({ ...record, recordNumber: records.length + 1 });
     }
-    const nonEmpty = records.filter((record) => record.studentId !== '' || record.score !== '');
-    if (nonEmpty.length === 0) throw new BadRequestException('The PDF contains no mark records.');
-    if (nonEmpty.length > MAX_RECORDS) {
+    if (records.length === 0) {
+      return extractPdfRecords(text.pages.map((page) => page.text).join('\n'), knownStudentIds);
+    }
+    if (records.length > MAX_RECORDS) {
       throw new PayloadTooLargeException(`A maximum of ${MAX_RECORDS} mark records can be imported at once.`);
     }
-    return nonEmpty;
+    return records;
   } catch (error: unknown) {
     if (error instanceof BadRequestException || error instanceof PayloadTooLargeException) throw error;
-    throw new BadRequestException('The PDF is corrupted or unreadable. A text-based PDF is required.');
+    throw new BadRequestException('The PDF could not be processed locally. Verify that it is readable and try again.');
   } finally {
     await parser.destroy();
   }
 }
 
-export async function extractMarkRecords(file: Express.Multer.File): Promise<ExtractedMarkRecord[]> {
+export async function extractMarkRecords(file: Express.Multer.File, knownStudentIds: string[] = []): Promise<ExtractedMarkRecord[]> {
   const extension = file.originalname.toLowerCase().split('.').pop();
   if (extension !== 'pdf' && extension !== 'xlsx' && extension !== 'csv') {
     throw new BadRequestException('Only PDF, .xlsx, and CSV documents are supported.');
   }
   if (!file.buffer?.length) throw new BadRequestException('Choose a non-empty document to upload.');
 
-  if (extension === 'pdf') return parsePdfDocument(file.buffer);
+  if (extension === 'pdf') return parsePdfDocument(file.buffer, knownStudentIds);
   if (extension === 'xlsx') return parseExcelDocument(file.buffer);
   return parseCsvDocument(file.buffer);
 }

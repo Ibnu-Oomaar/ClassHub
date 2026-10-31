@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsNumber, IsOptional, IsString, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 
@@ -8,6 +8,12 @@ export class ConfirmMarkImportEntryDto {
   @MinLength(1)
   @MaxLength(40)
   studentCode: string;
+
+  @ApiPropertyOptional({ maxLength: 150, description: 'Corrected document name kept only in the review request; database student names remain authoritative.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(150)
+  documentStudentName?: string;
 
   @ApiProperty({ example: 72.5 })
   @IsNumber({ maxDecimalPlaces: 2 })

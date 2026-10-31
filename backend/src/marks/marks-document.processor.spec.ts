@@ -1,7 +1,13 @@
 import PDFDocument from 'pdfkit';
 import ExcelJS from 'exceljs';
+import { createCanvas } from '@napi-rs/canvas';
 import { BadRequestException } from '@nestjs/common';
-import { extractMarkRecords } from './marks-document.processor';
+import { afterEach } from '@jest/globals';
+import { extractMarkRecords, terminateOcrWorker } from './marks-document.processor';
+
+afterEach(async () => {
+  await terminateOcrWorker();
+});
 
 function uploadedFile(name: string, buffer: Buffer): Express.Multer.File {
   return {
@@ -43,12 +49,34 @@ describe('marks document processing', () => {
     const finished = new Promise<Buffer>((resolve) => document.on('end', () => resolve(Buffer.concat(chunks))));
     document.text('Student ID', 50, 50);
     document.text('Score', 250, 50);
-    document.text('ST-003', 50, 80);
-    document.text('76', 250, 80);
+    document.text('ST-003 Jane Doe 76', 50, 80);
     document.end();
 
-    await expect(extractMarkRecords(uploadedFile('marks.pdf', await finished))).resolves.toEqual([
-      { studentId: 'ST-003', score: '76', recordNumber: 1 },
+    const records = await extractMarkRecords(uploadedFile('marks.pdf', await finished), ['ST-003']);
+    expect(records).toEqual([
+      expect.objectContaining({ studentId: 'ST-003', studentName: expect.stringMatching(/Jane Doe/i), score: '76', recordNumber: 1 }),
+    ]);
+  });
+
+  it('uses the bundled local OCR model for scanned PDFs without fixed headers', async () => {
+    const canvas = createCanvas(1200, 260);
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#000000';
+    context.font = 'bold 64px Arial';
+    context.fillText('ST-004 Jane Doe 88', 40, 150);
+
+    const document = new PDFDocument({ margin: 20 });
+    const chunks: Buffer[] = [];
+    document.on('data', (chunk: Buffer) => chunks.push(chunk));
+    const finished = new Promise<Buffer>((resolve) => document.on('end', () => resolve(Buffer.concat(chunks))));
+    document.image(canvas.toBuffer('image/png'), 20, 20, { width: 560 });
+    document.end();
+
+    const records = await extractMarkRecords(uploadedFile('scanned-results.pdf', await finished), ['ST-004']);
+    expect(records).toEqual([
+      expect.objectContaining({ studentId: 'ST-004', studentName: expect.stringMatching(/Jane Doe/i), score: '88' }),
     ]);
   });
 

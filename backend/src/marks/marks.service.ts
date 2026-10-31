@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnModuleDestroy, PayloadTooLargeException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, In, Repository } from 'typeorm';
@@ -22,12 +22,13 @@ import { Student } from '../students/students.entity';
 import { TeacherSubject } from '../teacher-subjects/teacher-subjects.entity';
 import { CreateMarkDto, MarkEntryDto } from './dto/create-mark.dto';
 import { ConfirmMarkImportDto } from './dto/confirm-mark-import.dto';
+import { ReviewMarkImportDto } from './dto/review-mark-import.dto';
 import { MarksQueueQueryDto } from './dto/marks-queue-query.dto';
 import { ReviewMarksDto } from './dto/review-marks.dto';
 import { SaveMarksDto } from './dto/save-marks.dto';
 import { UpdateMarkDto } from './dto/update-mark.dto';
 import { Mark } from './marks.entity';
-import { ExtractedMarkRecord, extractMarkRecords } from './marks-document.processor';
+import { ExtractedMarkRecord, extractMarkRecords, terminateOcrWorker } from './marks-document.processor';
 import {
   MAX_AUDITED_CHANGES,
   MarkEntryView,
@@ -61,6 +62,7 @@ interface EntryChange {
 }
 
 export interface MarkImportPreviewRecord extends ExtractedMarkRecord {
+  studentName: string;
   matchedStudentName: string | null;
   currentScore: number | null;
   issues: string[];
@@ -68,6 +70,7 @@ export interface MarkImportPreviewRecord extends ExtractedMarkRecord {
 }
 
 export interface MarkImportPreview {
+  isPdf: boolean;
   maxMarks: number;
   records: MarkImportPreviewRecord[];
   summary: {
@@ -82,7 +85,7 @@ export interface MarkImportPreview {
 }
 
 @Injectable()
-export class MarksService {
+export class MarksService implements OnModuleDestroy {
   private readonly maxImportBytes: number;
 
   constructor(
@@ -95,6 +98,10 @@ export class MarksService {
     config: ConfigService,
   ) {
     this.maxImportBytes = loadAppConfig(config).maxUploadBytes;
+  }
+
+  onModuleDestroy(): Promise<void> {
+    return terminateOcrWorker();
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -182,7 +189,33 @@ export class MarksService {
 
     const examSubject = await this.loadExamSubject(examinationSubjectId);
     await this.assertTeacherMayEdit(examSubject, actor);
-    const extracted = await extractMarkRecords(file);
+    const roster = await this.roster();
+    const extracted = await extractMarkRecords(file, roster.map((student) => student.studentId));
+    return this.validateImportRecords(examSubject, extracted, file.originalname.toLowerCase().endsWith('.pdf'));
+  }
+
+  async reviewImport(
+    examinationSubjectId: string,
+    dto: ReviewMarkImportDto,
+    actor: AuthenticatedUser,
+  ): Promise<MarkImportPreview> {
+    const examSubject = await this.loadExamSubject(examinationSubjectId);
+    await this.assertTeacherMayEdit(examSubject, actor);
+    const records: ExtractedMarkRecord[] = dto.records.map((record) => ({
+      studentId: record.studentCode,
+      studentName: record.studentName ?? '',
+      score: record.score,
+      recordNumber: record.recordNumber,
+    }));
+    return this.validateImportRecords(examSubject, records, true);
+  }
+
+  private async validateImportRecords(
+    examSubject: ExaminationSubject,
+    extracted: ExtractedMarkRecord[],
+    isPdf: boolean,
+  ): Promise<MarkImportPreview> {
+    const examinationSubjectId = examSubject.id;
     const roster = await this.roster();
     const studentByCode = new Map<string, Student[]>();
     for (const student of roster) {
@@ -215,11 +248,16 @@ export class MarksService {
 
       const score = this.readImportedScore(record.score, examSubject.maxMarks);
       if (score.issue) issues.push(score.issue);
+      if (isPdf && !record.studentName?.trim()) {
+        issues.push('Student full name could not be extracted; enter it for manual review.');
+      }
+      if (record.extractionIssue) issues.push(record.extractionIssue);
       const current = student ? marksByStudent.get(student.id) : undefined;
       if (current?.isAbsent) issues.push(`Student "${record.studentId}" is marked absent and cannot receive an imported score.`);
 
       return {
         ...record,
+        studentName: record.studentName ?? '',
         matchedStudentName: student?.user.fullName ?? null,
         currentScore: current?.score ?? null,
         issues,
@@ -228,6 +266,7 @@ export class MarksService {
     });
 
     return {
+      isPdf,
       maxMarks: examSubject.maxMarks,
       records,
       summary: {
