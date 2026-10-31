@@ -1,9 +1,11 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, In, Repository } from 'typeorm';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { AuditAction } from '../audit-logs/types/audit-log.types.interface';
 import { Role } from '../common/enums/role.enum';
+import { AccountStatus } from '../common/enums/account-status.enum';
 import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
 import { Paginated, buildPaginated, skipFor } from '../common/pagination/pagination.util';
 import { escapeLike, resolveSort } from '../common/utils/sort.util';
@@ -15,14 +17,17 @@ import {
   MarksStatus,
 } from '../examinations/types/examination.types.interface';
 import { GradingService } from '../grading/grading.service';
+import { loadAppConfig } from '../config/app.config';
 import { Student } from '../students/students.entity';
 import { TeacherSubject } from '../teacher-subjects/teacher-subjects.entity';
 import { CreateMarkDto, MarkEntryDto } from './dto/create-mark.dto';
+import { ConfirmMarkImportDto } from './dto/confirm-mark-import.dto';
 import { MarksQueueQueryDto } from './dto/marks-queue-query.dto';
 import { ReviewMarksDto } from './dto/review-marks.dto';
 import { SaveMarksDto } from './dto/save-marks.dto';
 import { UpdateMarkDto } from './dto/update-mark.dto';
 import { Mark } from './marks.entity';
+import { ExtractedMarkRecord, extractMarkRecords } from './marks-document.processor';
 import {
   MAX_AUDITED_CHANGES,
   MarkEntryView,
@@ -55,8 +60,31 @@ interface EntryChange {
   to: { score: number | null; absent: boolean } | null;
 }
 
+export interface MarkImportPreviewRecord extends ExtractedMarkRecord {
+  matchedStudentName: string | null;
+  currentScore: number | null;
+  issues: string[];
+  valid: boolean;
+}
+
+export interface MarkImportPreview {
+  maxMarks: number;
+  records: MarkImportPreviewRecord[];
+  summary: {
+    totalRecords: number;
+    matchedRecords: number;
+    validScores: number;
+    invalidRecords: number;
+    unknownStudentIds: number;
+    duplicateStudentIds: number;
+    overwrites: number;
+  };
+}
+
 @Injectable()
 export class MarksService {
+  private readonly maxImportBytes: number;
+
   constructor(
     @InjectRepository(Mark) private readonly marks: Repository<Mark>,
     @InjectRepository(ExaminationSubject) private readonly examSubjects: Repository<ExaminationSubject>,
@@ -64,7 +92,10 @@ export class MarksService {
     @InjectRepository(TeacherSubject) private readonly teacherSubjects: Repository<TeacherSubject>,
     private readonly grading: GradingService,
     private readonly audit: AuditLogsService,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.maxImportBytes = loadAppConfig(config).maxUploadBytes;
+  }
 
   // ---------------------------------------------------------------------------------------------
   // Reading
@@ -136,6 +167,185 @@ export class MarksService {
   /** Saves, changes or clears many entries of one sheet in a single transaction. */
   async saveEntries(examinationSubjectId: string, dto: SaveMarksDto, actor: AuthenticatedUser): Promise<MarkSheetView> {
     await this.applyEntries(examinationSubjectId, dto.entries, actor);
+    return this.getSheet(examinationSubjectId, actor);
+  }
+
+  async previewImport(
+    examinationSubjectId: string,
+    file: Express.Multer.File | undefined,
+    actor: AuthenticatedUser,
+  ): Promise<MarkImportPreview> {
+    if (!file?.buffer?.length) throw new BadRequestException('Choose a document to upload.');
+    if (file.size > this.maxImportBytes) {
+      throw new PayloadTooLargeException(`The document is larger than the ${Math.floor(this.maxImportBytes / (1024 * 1024))} MB limit.`);
+    }
+
+    const examSubject = await this.loadExamSubject(examinationSubjectId);
+    await this.assertTeacherMayEdit(examSubject, actor);
+    const extracted = await extractMarkRecords(file);
+    const roster = await this.roster();
+    const studentByCode = new Map<string, Student[]>();
+    for (const student of roster) {
+      const code = this.normalizeStudentCode(student.studentId);
+      studentByCode.set(code, [...(studentByCode.get(code) ?? []), student]);
+    }
+
+    const recordCounts = new Map<string, number>();
+    for (const record of extracted) {
+      const code = this.normalizeStudentCode(record.studentId);
+      if (code) recordCounts.set(code, (recordCounts.get(code) ?? 0) + 1);
+    }
+
+    const marks = await this.marks.find({ where: { examinationSubjectId } });
+    const marksByStudent = new Map(marks.map((mark) => [mark.studentId, mark]));
+    const records: MarkImportPreviewRecord[] = extracted.map((record) => {
+      const code = this.normalizeStudentCode(record.studentId);
+      const issues: string[] = [];
+      if (!code) issues.push('Missing Student ID.');
+      const duplicate = !!code && (recordCounts.get(code) ?? 0) > 1;
+      if (duplicate) issues.push(`Duplicate Student ID "${record.studentId}". Remove or correct every duplicate record.`);
+
+      const matches = code ? studentByCode.get(code) ?? [] : [];
+      const student = matches.length === 1 ? matches[0] : undefined;
+      if (code && matches.length === 0) issues.push(`Unknown Student ID "${record.studentId}".`);
+      if (matches.length > 1) issues.push(`Student ID "${record.studentId}" matches more than one student and is ambiguous.`);
+      if (student && student.user.status !== AccountStatus.ACTIVE) {
+        issues.push(`Student "${record.studentId}" is not active and cannot receive marks.`);
+      }
+
+      const score = this.readImportedScore(record.score, examSubject.maxMarks);
+      if (score.issue) issues.push(score.issue);
+      const current = student ? marksByStudent.get(student.id) : undefined;
+      if (current?.isAbsent) issues.push(`Student "${record.studentId}" is marked absent and cannot receive an imported score.`);
+
+      return {
+        ...record,
+        matchedStudentName: student?.user.fullName ?? null,
+        currentScore: current?.score ?? null,
+        issues,
+        valid: issues.length === 0,
+      };
+    });
+
+    return {
+      maxMarks: examSubject.maxMarks,
+      records,
+      summary: {
+        totalRecords: records.length,
+        matchedRecords: records.filter((record) => record.matchedStudentName !== null).length,
+        validScores: records.filter((record) => record.valid).length,
+        invalidRecords: records.filter((record) => !record.valid).length,
+        unknownStudentIds: records.filter((record) => record.issues.some((issue) => issue.startsWith('Unknown Student ID'))).length,
+        duplicateStudentIds: records.filter((record) => record.issues.some((issue) => issue.startsWith('Duplicate Student ID'))).length,
+        overwrites: records.filter((record) => record.valid && record.currentScore !== null).length,
+      },
+    };
+  }
+
+  async confirmImport(
+    examinationSubjectId: string,
+    dto: ConfirmMarkImportDto,
+    actor: AuthenticatedUser,
+  ): Promise<MarkSheetView> {
+    const result = await this.marks.manager.transaction(async (manager) => {
+      const examSubject = await this.lockExamSubject(manager, examinationSubjectId);
+      await this.assertTeacherMayEdit(examSubject, actor, manager);
+      const roster = new Map((await this.roster(manager)).map((student) => [this.normalizeStudentCode(student.studentId), student]));
+      const seen = new Set<string>();
+      const validated = dto.entries.map((entry) => {
+        const code = this.normalizeStudentCode(entry.studentCode);
+        if (!code || seen.has(code)) throw new BadRequestException(`Student ID "${entry.studentCode}" is missing or duplicated.`);
+        seen.add(code);
+        const student = roster.get(code);
+        if (!student) throw new BadRequestException(`Unknown Student ID "${entry.studentCode}".`);
+        if (student.user.status !== AccountStatus.ACTIVE) {
+          throw new BadRequestException(`Student "${entry.studentCode}" is not active and cannot receive marks.`);
+        }
+        const score = this.readImportedScore(String(entry.score), examSubject.maxMarks);
+        if (score.issue || score.value === null) {
+          throw new BadRequestException(`Student "${entry.studentCode}": ${score.issue ?? 'Score is invalid.'}`);
+        }
+        return {
+          student,
+          score: score.value,
+          studentCode: entry.studentCode,
+          expectedCurrentScore: entry.expectedCurrentScore,
+        };
+      });
+
+      const repository = manager.getRepository(Mark);
+      const existing = await repository.find({
+        where: { examinationSubjectId, studentId: In(validated.map(({ student }) => student.id)) },
+      });
+      const existingByStudent = new Map(existing.map((mark) => [mark.studentId, mark]));
+      const overwrites = validated.filter(({ student }) => {
+        const current = existingByStudent.get(student.id);
+        if (current?.isAbsent) {
+          throw new BadRequestException(`Student ID "${student.studentId}" is marked absent and cannot receive an imported score.`);
+        }
+        return current?.score !== null && current?.score !== undefined;
+      });
+      for (const { student, expectedCurrentScore } of validated) {
+        const currentScore = existingByStudent.get(student.id)?.score ?? null;
+        if (expectedCurrentScore !== currentScore) {
+          throw new ConflictException('Scores changed after the preview. Upload and review the document again before confirming.');
+        }
+      }
+      if (overwrites.length > 0 && !dto.overwriteExisting) {
+        throw new ConflictException('Existing scores would be overwritten. Review the current and incoming scores and explicitly confirm the overwrite.');
+      }
+
+      const changes: EntryChange[] = [];
+      let created = 0;
+      let updated = 0;
+      for (const { student, score } of validated) {
+        const current = existingByStudent.get(student.id);
+        if (current) {
+          await repository.update({ id: current.id }, { score });
+          updated++;
+          changes.push({
+            studentId: student.id,
+            student: student.user.fullName,
+            from: { score: current.score, absent: current.isAbsent },
+            to: { score, absent: false },
+          });
+        } else {
+          await repository.save(
+            repository.create({
+              examinationSubjectId,
+              studentId: student.id,
+              score,
+              isAbsent: false,
+              enteredById: actor.id,
+            }),
+          );
+          created++;
+          changes.push({ studentId: student.id, student: student.user.fullName, from: null, to: { score, absent: false } });
+        }
+      }
+
+      if (examSubject.marksStatus === MarksStatus.PENDING && created + updated > 0) {
+        await manager.getRepository(ExaminationSubject).update({ id: examinationSubjectId }, { marksStatus: MarksStatus.DRAFT });
+      }
+      return { created, updated, changes, examinationId: examSubject.examinationId, subjectId: examSubject.subjectId };
+    });
+
+    await this.audit.record({
+      actor,
+      action: result.updated > 0 ? AuditAction.MARKS_UPDATED : AuditAction.MARKS_SAVED,
+      entityType: 'ExaminationSubject',
+      entityId: examinationSubjectId,
+      summary: `Marks imported: ${result.created} added, ${result.updated} changed`,
+      details: {
+        examinationId: result.examinationId,
+        subjectId: result.subjectId,
+        created: result.created,
+        updated: result.updated,
+        changes: result.changes.slice(0, MAX_AUDITED_CHANGES),
+        changesTruncated: result.changes.length > MAX_AUDITED_CHANGES,
+      },
+    });
+
     return this.getSheet(examinationSubjectId, actor);
   }
 
@@ -560,5 +770,23 @@ export class MarksService {
           : 'These marks are submitted and waiting for the Class Master. They are locked until reviewed.',
       );
     }
+  }
+
+  private normalizeStudentCode(code: string): string {
+    return code.trim().toUpperCase();
+  }
+
+  private readImportedScore(raw: string, maxMarks: number): { value: number | null; issue?: string } {
+    const valueText = raw.trim();
+    if (!valueText) return { value: null, issue: 'Missing score.' };
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(valueText)) return { value: null, issue: `Invalid or unreadable score "${valueText}".` };
+    const value = Number(valueText);
+    if (!Number.isFinite(value)) return { value: null, issue: `Invalid score "${valueText}".` };
+    if (value < 0) return { value: null, issue: `Score ${valueText} cannot be negative.` };
+    if (Math.abs(value * 100 - Math.round(value * 100)) > 1e-6) {
+      return { value: null, issue: `Score ${valueText} has more than 2 decimal places and cannot be rounded automatically.` };
+    }
+    if (cents(value) > cents(maxMarks)) return { value: null, issue: `Score ${valueText} is above the maximum of ${maxMarks}.` };
+    return { value };
   }
 }

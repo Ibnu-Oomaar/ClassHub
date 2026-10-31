@@ -10,7 +10,7 @@ import { User } from '../users/users.entity';
 const CLASS_MASTER = {
   fullName: 'Abdirisak Abdirashid Muhumed',
   username: 'a.ration',
-  email: 'ration@gmail.com',
+  email: 'ratio@gmail.com',
 };
 
 async function seedClassMaster(): Promise<void> {

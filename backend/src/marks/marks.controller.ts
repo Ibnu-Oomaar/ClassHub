@@ -1,11 +1,13 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Put, Query } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Put, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { Role } from '../common/enums/role.enum';
 import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
 import { Paginated } from '../common/pagination/pagination.util';
 import { CreateMarkDto } from './dto/create-mark.dto';
+import { ConfirmMarkImportDto } from './dto/confirm-mark-import.dto';
 import { MarksQueueQueryDto } from './dto/marks-queue-query.dto';
 import { ReviewMarksDto } from './dto/review-marks.dto';
 import { SaveMarksDto } from './dto/save-marks.dto';
@@ -13,6 +15,8 @@ import { SubmitMarksDto } from './dto/submit-marks.dto';
 import { UpdateMarkDto } from './dto/update-mark.dto';
 import { MarksService } from './marks.service';
 import { MarkEntryView, MarkSheetView, MarksQueueItem } from './types/mark.types.interface';
+
+const MARKS_IMPORT_MAX_BYTES = Number(process.env.MAX_UPLOAD_MB ?? '10') * 1024 * 1024;
 
 /**
  * Marks workflow: teachers enter and submit, the Class Master approves or rejects.
@@ -50,6 +54,32 @@ export class MarksController {
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<MarkSheetView> {
     return this.marks.saveEntries(id, dto, user);
+  }
+
+  @Post('examination-subjects/:id/import-preview')
+  @Roles(Role.TEACHER)
+  @ApiOperation({ summary: 'Validate and preview marks from a PDF, .xlsx, or CSV document' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({ schema: { type: 'object', required: ['file'], properties: { file: { type: 'string', format: 'binary' } } } })
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MARKS_IMPORT_MAX_BYTES, files: 1 } }))
+  previewImport(
+    @Param('id', ParseUUIDPipe) id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.marks.previewImport(id, file, user);
+  }
+
+  @Post('examination-subjects/:id/import-confirm')
+  @HttpCode(200)
+  @Roles(Role.TEACHER)
+  @ApiOperation({ summary: 'Confirm validated marks and atomically save only their scores' })
+  confirmImport(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ConfirmMarkImportDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<MarkSheetView> {
+    return this.marks.confirmImport(id, dto, user);
   }
 
   @Post('examination-subjects/:id/submit')

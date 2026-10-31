@@ -20,6 +20,7 @@ import { keys } from '@/lib/query-keys';
 import { useAction } from '@/lib/use-action';
 import { cn } from '@/lib/utils';
 import { ReviewActions } from './review-actions';
+import { MarksImportPanel } from './marks-import-panel';
 import type { MarkEntry, MarkSheet } from './types';
 
 interface Draft {
@@ -178,6 +179,13 @@ function Sheet({ sheet, editableByMe, bands }: { sheet: MarkSheet; editableByMe:
         <Alert tone="info" className="mb-5">
           {sheet.marksStatus === 'REJECTED' ? 'The teacher is correcting these marks.' : 'The teacher has not submitted this sheet yet. You can only read it for now.'}
         </Alert>
+      ) : null}
+
+      {editableByMe ? (
+        <MarksImportPanel
+          examinationSubjectId={sheet.examinationSubjectId}
+          disabled={dirtyRows.length > 0 || busy}
+        />
       ) : null}
 
       {sheet.total === 0 ? (
